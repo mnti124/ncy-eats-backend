@@ -15,7 +15,11 @@ import org.springframework.web.client.RestClientException;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.*;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Looks up restaurants via OpenStreetMap — free, no API key:
@@ -27,12 +31,20 @@ public class OsmPlacesService {
 
     private static final Logger log = LoggerFactory.getLogger(OsmPlacesService.class);
 
-    private static final String OVERPASS_URL = "https://overpass-api.de/api/interpreter";
+    // overpass-api.de is a single shared free instance that gets overloaded; fail over to an
+    // independent mirror instead of waiting out a full timeout against it and giving up.
+    private static final List<String> OVERPASS_URLS = List.of(
+            "https://overpass-api.de/api/interpreter",
+            "https://overpass.osm.ch/api/interpreter");
     private static final String NOMINATIM_URL = "https://nominatim.openstreetmap.org";
     /** NYC bounding box: west, north, east, south (Nominatim viewbox order). */
     private static final String NYC_VIEWBOX = "-74.2591,40.9176,-73.7004,40.4774";
     private static final List<String> BOROUGHS = List.of("Manhattan", "Brooklyn", "Queens", "Bronx", "Staten Island");
     private static final Duration CACHE_TTL = Duration.ofMinutes(10);
+    /** A coordinate's borough never changes, so it's safe to cache for a long time. */
+    private static final Duration BOROUGH_CACHE_TTL = Duration.ofHours(12);
+    /** Borough is best-effort metadata; never let it hold up the places the map actually needs. */
+    private static final Duration BOROUGH_LOOKUP_BUDGET = Duration.ofSeconds(3);
 
     public record Place(
             String osmId,
@@ -48,16 +60,33 @@ public class OsmPlacesService {
     public record NearbyResult(String borough, List<Place> places) {}
 
     private record CacheEntry(Instant at, NearbyResult value) {}
+    private record BoroughEntry(Instant at, String value) {}
 
     private final RestClient http;
+    private final RestClient boroughHttp;
+    private final ExecutorService boroughExecutor = Executors.newVirtualThreadPerTaskExecutor();
     private final Map<String, CacheEntry> nearbyCache = new ConcurrentHashMap<>();
+    private final Map<String, BoroughEntry> boroughCache = new ConcurrentHashMap<>();
 
     public OsmPlacesService(AppProperties props) {
+        // Kept short per attempt: with multiple Overpass mirrors to fail over across, a slow one
+        // should be abandoned quickly rather than tying up the request for a full 20s each.
         SimpleClientHttpRequestFactory factory = new SimpleClientHttpRequestFactory();
         factory.setConnectTimeout(Duration.ofSeconds(5));
-        factory.setReadTimeout(Duration.ofSeconds(20));
+        factory.setReadTimeout(Duration.ofSeconds(10));
         this.http = RestClient.builder()
                 .requestFactory(factory)
+                .defaultHeader("User-Agent", props.osmUserAgent())
+                .defaultHeader("Accept", "application/json")
+                .build();
+
+        // Separate, short-timeout client for the best-effort borough lookup so a slow Nominatim
+        // response can't drag out the whole /nearby call the way sharing `http`'s 20s timeout would.
+        SimpleClientHttpRequestFactory boroughFactory = new SimpleClientHttpRequestFactory();
+        boroughFactory.setConnectTimeout(Duration.ofSeconds(2));
+        boroughFactory.setReadTimeout(Duration.ofSeconds(3));
+        this.boroughHttp = RestClient.builder()
+                .requestFactory(boroughFactory)
                 .defaultHeader("User-Agent", props.osmUserAgent())
                 .defaultHeader("Accept", "application/json")
                 .build();
@@ -69,7 +98,10 @@ public class OsmPlacesService {
         CacheEntry cached = nearbyCache.get(key);
         if (cached != null && cached.at().plus(CACHE_TTL).isAfter(Instant.now())) return cached.value();
 
-        String borough = reverseBorough(lat, lng);
+        // Borough and places come from two independent services (Nominatim, Overpass) — look them up
+        // concurrently instead of one after the other so the map isn't waiting on their combined latency.
+        CompletableFuture<String> boroughFuture = CompletableFuture.supplyAsync(() -> boroughCached(lat, lng), boroughExecutor);
+
         String query = String.format(Locale.ROOT, """
                 [out:json][timeout:15];
                 nwr["amenity"~"^(restaurant|cafe|fast_food|bar|pub|ice_cream|food_court|biergarten)$"]["name"](around:%d,%f,%f);
@@ -79,31 +111,24 @@ public class OsmPlacesService {
         MultiValueMap<String, String> form = new LinkedMultiValueMap<>();
         form.add("data", query);
 
+        JsonNode body = queryOverpass(form);
+
+        String borough = awaitBorough(boroughFuture);
         List<Place> places = new ArrayList<>();
-        try {
-            JsonNode body = http.post().uri(OVERPASS_URL)
-                    .contentType(MediaType.APPLICATION_FORM_URLENCODED)
-                    .body(form)
-                    .retrieve()
-                    .body(JsonNode.class);
-            if (body != null) {
-                for (JsonNode el : body.path("elements")) {
-                    JsonNode tags = el.path("tags");
-                    double pLat = el.has("lat") ? el.path("lat").asDouble() : el.path("center").path("lat").asDouble();
-                    double pLng = el.has("lon") ? el.path("lon").asDouble() : el.path("center").path("lon").asDouble();
-                    places.add(new Place(
-                            el.path("type").asText() + "/" + el.path("id").asText(),
-                            tags.path("name").asText(),
-                            prettyCuisine(text(tags, "cuisine"), text(tags, "amenity")),
-                            streetAddress(tags),
-                            borough,
-                            pLat, pLng,
-                            (int) Math.round(haversineMeters(lat, lng, pLat, pLng))));
-                }
+        if (body != null) {
+            for (JsonNode el : body.path("elements")) {
+                JsonNode tags = el.path("tags");
+                double pLat = el.has("lat") ? el.path("lat").asDouble() : el.path("center").path("lat").asDouble();
+                double pLng = el.has("lon") ? el.path("lon").asDouble() : el.path("center").path("lon").asDouble();
+                places.add(new Place(
+                        el.path("type").asText() + "/" + el.path("id").asText(),
+                        tags.path("name").asText(),
+                        prettyCuisine(text(tags, "cuisine"), text(tags, "amenity")),
+                        streetAddress(tags),
+                        borough,
+                        pLat, pLng,
+                        (int) Math.round(haversineMeters(lat, lng, pLat, pLng))));
             }
-        } catch (RestClientException e) {
-            log.warn("Overpass lookup failed: {}", e.getMessage());
-            throw new PlacesUnavailableException("Couldn't look up nearby places right now. You can still search or add one manually.");
         }
 
         places.sort(Comparator.comparingInt(Place::distanceMeters));
@@ -111,6 +136,25 @@ public class OsmPlacesService {
         nearbyCache.put(key, new CacheEntry(Instant.now(), result));
         if (nearbyCache.size() > 500) nearbyCache.clear();
         return result;
+    }
+
+    /** Tries each Overpass mirror in turn, returning the first success; throws only if all of them fail. */
+    private JsonNode queryOverpass(MultiValueMap<String, String> form) {
+        RestClientException lastFailure = null;
+        for (String url : OVERPASS_URLS) {
+            try {
+                return http.post().uri(url)
+                        .contentType(MediaType.APPLICATION_FORM_URLENCODED)
+                        .body(form)
+                        .retrieve()
+                        .body(JsonNode.class);
+            } catch (RestClientException e) {
+                log.warn("Overpass mirror {} failed: {}", url, e.getMessage());
+                lastFailure = e;
+            }
+        }
+        throw new PlacesUnavailableException("Couldn't look up nearby places right now. You can still search or add one manually.",
+                lastFailure);
     }
 
     public List<Place> search(String q, Double nearLat, Double nearLng) {
@@ -149,13 +193,35 @@ public class OsmPlacesService {
     /** Best-effort borough for a coordinate; null if it can't be determined. */
     public String reverseBorough(double lat, double lng) {
         try {
-            JsonNode body = http.get().uri(NOMINATIM_URL + "/reverse?format=jsonv2&zoom=14&addressdetails=1&lat={lat}&lon={lng}",
+            JsonNode body = boroughHttp.get().uri(NOMINATIM_URL + "/reverse?format=jsonv2&zoom=14&addressdetails=1&lat={lat}&lon={lng}",
                             lat, lng)
                     .retrieve()
                     .body(JsonNode.class);
             return body == null ? null : boroughFrom(body.path("address"));
         } catch (RestClientException e) {
             log.debug("Reverse geocode failed: {}", e.getMessage());
+            return null;
+        }
+    }
+
+    /** Reads through the long-lived borough cache; only successful lookups are cached. */
+    private String boroughCached(double lat, double lng) {
+        String key = String.format(Locale.ROOT, "%.3f,%.3f", lat, lng);
+        BoroughEntry cached = boroughCache.get(key);
+        if (cached != null && cached.at().plus(BOROUGH_CACHE_TTL).isAfter(Instant.now())) return cached.value();
+        String borough = reverseBorough(lat, lng);
+        if (borough != null) {
+            boroughCache.put(key, new BoroughEntry(Instant.now(), borough));
+            if (boroughCache.size() > 2000) boroughCache.clear();
+        }
+        return borough;
+    }
+
+    /** Waits a bounded amount of extra time for the borough lookup; gives up rather than stall the response. */
+    private static String awaitBorough(CompletableFuture<String> boroughFuture) {
+        try {
+            return boroughFuture.get(BOROUGH_LOOKUP_BUDGET.toMillis(), TimeUnit.MILLISECONDS);
+        } catch (Exception e) {
             return null;
         }
     }
