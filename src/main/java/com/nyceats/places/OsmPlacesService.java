@@ -31,14 +31,16 @@ public class OsmPlacesService {
 
     private static final Logger log = LoggerFactory.getLogger(OsmPlacesService.class);
 
-    // overpass-api.de is a single shared free instance that gets overloaded; fail over to its
-    // own load-balanced lz4 subdomain instead of waiting out a full timeout and giving up.
+    // overpass-api.de (and its lz4 subdomain — same operator, same firewall) actively refuses
+    // connections from many cloud/hosting IP ranges, including Render's: confirmed in production
+    // logs as "Connection refused", not a timeout. Kumi Systems is a separately operated instance
+    // on different infrastructure, so it's a real fallback rather than hitting the same block twice.
     // (overpass.osm.ch was tried and dropped: its database is permanently stale and it returns
     // HTTP 200 with zero results for every query, which silently looks like "nothing nearby"
     // instead of a visible failure — see isFreshOverpassResponse below for the general guard.)
     private static final List<String> OVERPASS_URLS = List.of(
             "https://overpass-api.de/api/interpreter",
-            "https://lz4.overpass-api.de/api/interpreter");
+            "https://overpass.kumi.systems/api/interpreter");
     private static final String NOMINATIM_URL = "https://nominatim.openstreetmap.org";
     /** NYC bounding box: west, north, east, south (Nominatim viewbox order). */
     private static final String NYC_VIEWBOX = "-74.2591,40.9176,-73.7004,40.4774";
