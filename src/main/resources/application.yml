@@ -1,0 +1,46 @@
+server:
+  port: ${PORT:8080}
+  # Render/Railway/Fly sit behind a proxy; honor X-Forwarded-* headers
+  forward-headers-strategy: framework
+  error:
+    include-message: always
+
+spring:
+  application:
+    name: nyc-eats-api
+  datasource:
+    # Supabase → Project Settings → Database → Connection string → "Session pooler" (IPv4-friendly).
+    # Convert it to JDBC form, e.g.
+    #   jdbc:postgresql://aws-0-us-east-1.pooler.supabase.com:5432/postgres?sslmode=require
+    url: ${DATABASE_URL:jdbc:postgresql://localhost:5433/postgres}
+    username: ${DATABASE_USERNAME:postgres}   # session pooler user looks like postgres.<project-ref>
+    password: ${DATABASE_PASSWORD:postgres}
+    hikari:
+      maximum-pool-size: ${DB_POOL_SIZE:5}    # Supabase free tier has a small connection budget
+      minimum-idle: 1
+      connection-timeout: 10000
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: none                          # schema is owned by supabase/schema.sql
+    properties:
+      hibernate:
+        jdbc:
+          time_zone: UTC
+
+app:
+  # Comma-separated list of origins allowed to call the API from a browser.
+  # The Next.js app proxies /api through its own server, so this mostly matters for local dev
+  # or if you call the API directly. Wildcards like https://*.vercel.app are supported.
+  allowed-origins: ${ALLOWED_ORIGINS:http://localhost:3000,https://*.vercel.app}
+  # Optional shared secret. When set, POST/PATCH/DELETE require header X-Edit-Key with this value.
+  # Leave empty to let anyone with the link add places (what you asked for).
+  edit-key: ${EDIT_KEY:}
+  # Identifies the app to OpenStreetMap services (their usage policy requires a real contact).
+  osm-user-agent: ${OSM_USER_AGENT:nyc-eats/1.0 (personal restaurant tracker)}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health

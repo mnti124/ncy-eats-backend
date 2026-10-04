@@ -1,0 +1,21 @@
+# Render Blueprint for this API. Render → New → Blueprint → pick this repo.
+services:
+  - type: web
+    name: nyc-eats-api
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    healthCheckPath: /actuator/health
+    envVars:
+      - key: DATABASE_URL
+        sync: false   # jdbc:postgresql://aws-0-<region>.pooler.supabase.com:5432/postgres?sslmode=require
+      - key: DATABASE_USERNAME
+        sync: false   # postgres.<project-ref>
+      - key: DATABASE_PASSWORD
+        sync: false
+      - key: ALLOWED_ORIGINS
+        value: http://localhost:3000,https://*.vercel.app
+      - key: EDIT_KEY
+        sync: false   # optional; leave blank so anyone with the link can add places
+      - key: OSM_USER_AGENT
+        value: nyc-eats/1.0 (personal restaurant tracker)
