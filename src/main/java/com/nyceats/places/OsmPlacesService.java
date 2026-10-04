@@ -31,11 +31,14 @@ public class OsmPlacesService {
 
     private static final Logger log = LoggerFactory.getLogger(OsmPlacesService.class);
 
-    // overpass-api.de is a single shared free instance that gets overloaded; fail over to an
-    // independent mirror instead of waiting out a full timeout against it and giving up.
+    // overpass-api.de is a single shared free instance that gets overloaded; fail over to its
+    // own load-balanced lz4 subdomain instead of waiting out a full timeout and giving up.
+    // (overpass.osm.ch was tried and dropped: its database is permanently stale and it returns
+    // HTTP 200 with zero results for every query, which silently looks like "nothing nearby"
+    // instead of a visible failure — see isFreshOverpassResponse below for the general guard.)
     private static final List<String> OVERPASS_URLS = List.of(
             "https://overpass-api.de/api/interpreter",
-            "https://overpass.osm.ch/api/interpreter");
+            "https://lz4.overpass-api.de/api/interpreter");
     private static final String NOMINATIM_URL = "https://nominatim.openstreetmap.org";
     /** NYC bounding box: west, north, east, south (Nominatim viewbox order). */
     private static final String NYC_VIEWBOX = "-74.2591,40.9176,-73.7004,40.4774";
@@ -138,16 +141,19 @@ public class OsmPlacesService {
         return result;
     }
 
-    /** Tries each Overpass mirror in turn, returning the first success; throws only if all of them fail. */
+    /** Tries each Overpass mirror in turn, returning the first fresh success; throws only if all of them fail. */
     private JsonNode queryOverpass(MultiValueMap<String, String> form) {
         RestClientException lastFailure = null;
         for (String url : OVERPASS_URLS) {
             try {
-                return http.post().uri(url)
+                JsonNode body = http.post().uri(url)
                         .contentType(MediaType.APPLICATION_FORM_URLENCODED)
                         .body(form)
                         .retrieve()
                         .body(JsonNode.class);
+                if (isFreshOverpassResponse(body)) return body;
+                log.warn("Overpass mirror {} returned a response with no valid data timestamp "
+                        + "(likely serving a stale database); trying the next mirror", url);
             } catch (RestClientException e) {
                 log.warn("Overpass mirror {} failed: {}", url, e.getMessage());
                 lastFailure = e;
@@ -155,6 +161,16 @@ public class OsmPlacesService {
         }
         throw new PlacesUnavailableException("Couldn't look up nearby places right now. You can still search or add one manually.",
                 lastFailure);
+    }
+
+    /**
+     * Every genuine Overpass instance stamps its response with the real-world time its database
+     * was last updated (osm3s.timestamp_osm_base, e.g. "2026-10-04T19:50:58Z"). A misconfigured or
+     * stale instance can still return HTTP 200 with that field garbled and an empty result set —
+     * indistinguishable from "no places nearby" unless we check for a plausible timestamp first.
+     */
+    private static boolean isFreshOverpassResponse(JsonNode body) {
+        return body != null && body.path("osm3s").path("timestamp_osm_base").asText("").matches("\\d{4}-\\d{2}-\\d{2}T.*");
     }
 
     public List<Place> search(String q, Double nearLat, Double nearLng) {
