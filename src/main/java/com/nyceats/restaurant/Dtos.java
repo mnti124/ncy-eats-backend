@@ -30,7 +30,8 @@ public final class Dtos {
             @Size(max = 100) String cuisine,
             @DecimalMin("-90") @DecimalMax("90") Double latitude,
             @DecimalMin("-180") @DecimalMax("180") Double longitude,
-            @Size(max = 50) String osmId,
+            // Geoapify place ids ("geoapify/<id>") run well past OSM's old "node/123" length (~100 chars observed).
+            @Size(max = 200) String osmId,
             @NotNull @Valid VisitRequest visit
     ) {}
 
