@@ -4,11 +4,8 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.nyceats.config.AppProperties;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.http.MediaType;
 import org.springframework.http.client.SimpleClientHttpRequestFactory;
 import org.springframework.stereotype.Service;
-import org.springframework.util.LinkedMultiValueMap;
-import org.springframework.util.MultiValueMap;
 import org.springframework.web.client.RestClient;
 import org.springframework.web.client.RestClientException;
 
@@ -22,25 +19,24 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 
 /**
- * Looks up restaurants via OpenStreetMap — free, no API key:
- *  - Overpass API: food places near a coordinate
- *  - Nominatim:    text search within NYC, and reverse geocoding to guess the borough
+ * Looks up restaurants for the "nearby" map and for free-text search:
+ *  - Geoapify Places: food places near a coordinate (requires GEOAPIFY_API_KEY)
+ *  - Nominatim:       text search within NYC, and reverse geocoding to guess the borough
+ *
+ * Nearby search used to go through OpenStreetMap's free Overpass API directly, but every public
+ * Overpass instance we tried turned out unusable from a hosted (Render) deployment: overpass-api.de
+ * and its lz4 mirror actively refuse connections from many cloud/hosting IP ranges, overpass.osm.ch
+ * serves a permanently stale database (HTTP 200, zero results, always), and Kumi Systems' instance
+ * was simply unresponsive. Geoapify's Places API is itself built on OSM data but run as a proper
+ * hosted service with no such restrictions.
  */
 @Service
 public class OsmPlacesService {
 
     private static final Logger log = LoggerFactory.getLogger(OsmPlacesService.class);
 
-    // overpass-api.de (and its lz4 subdomain — same operator, same firewall) actively refuses
-    // connections from many cloud/hosting IP ranges, including Render's: confirmed in production
-    // logs as "Connection refused", not a timeout. Kumi Systems is a separately operated instance
-    // on different infrastructure, so it's a real fallback rather than hitting the same block twice.
-    // (overpass.osm.ch was tried and dropped: its database is permanently stale and it returns
-    // HTTP 200 with zero results for every query, which silently looks like "nothing nearby"
-    // instead of a visible failure — see isFreshOverpassResponse below for the general guard.)
-    private static final List<String> OVERPASS_URLS = List.of(
-            "https://overpass-api.de/api/interpreter",
-            "https://overpass.kumi.systems/api/interpreter");
+    private static final String GEOAPIFY_PLACES_URL = "https://api.geoapify.com/v2/places";
+    private static final String GEOAPIFY_CATEGORIES = "catering.restaurant,catering.cafe,catering.fast_food,catering.bar,catering.pub,catering.ice_cream";
     private static final String NOMINATIM_URL = "https://nominatim.openstreetmap.org";
     /** NYC bounding box: west, north, east, south (Nominatim viewbox order). */
     private static final String NYC_VIEWBOX = "-74.2591,40.9176,-73.7004,40.4774";
@@ -69,13 +65,13 @@ public class OsmPlacesService {
 
     private final RestClient http;
     private final RestClient boroughHttp;
+    private final String geoapifyApiKey;
     private final ExecutorService boroughExecutor = Executors.newVirtualThreadPerTaskExecutor();
     private final Map<String, CacheEntry> nearbyCache = new ConcurrentHashMap<>();
     private final Map<String, BoroughEntry> boroughCache = new ConcurrentHashMap<>();
 
     public OsmPlacesService(AppProperties props) {
-        // Kept short per attempt: with multiple Overpass mirrors to fail over across, a slow one
-        // should be abandoned quickly rather than tying up the request for a full 20s each.
+        this.geoapifyApiKey = props.geoapifyApiKey();
         SimpleClientHttpRequestFactory factory = new SimpleClientHttpRequestFactory();
         factory.setConnectTimeout(Duration.ofSeconds(5));
         factory.setReadTimeout(Duration.ofSeconds(10));
@@ -103,33 +99,42 @@ public class OsmPlacesService {
         CacheEntry cached = nearbyCache.get(key);
         if (cached != null && cached.at().plus(CACHE_TTL).isAfter(Instant.now())) return cached.value();
 
-        // Borough and places come from two independent services (Nominatim, Overpass) — look them up
+        if (geoapifyApiKey == null || geoapifyApiKey.isBlank()) {
+            log.warn("GEOAPIFY_API_KEY is not set; nearby places search is disabled");
+            throw new PlacesUnavailableException("Nearby places search isn't configured yet. You can still search or add one manually.");
+        }
+
+        // Borough and places come from two independent services (Nominatim, Geoapify) — look them up
         // concurrently instead of one after the other so the map isn't waiting on their combined latency.
         CompletableFuture<String> boroughFuture = CompletableFuture.supplyAsync(() -> boroughCached(lat, lng), boroughExecutor);
 
-        String query = String.format(Locale.ROOT, """
-                [out:json][timeout:15];
-                nwr["amenity"~"^(restaurant|cafe|fast_food|bar|pub|ice_cream|food_court|biergarten)$"]["name"](around:%d,%f,%f);
-                out center tags 80;
-                """, radius, lat, lng);
-
-        MultiValueMap<String, String> form = new LinkedMultiValueMap<>();
-        form.add("data", query);
-
-        JsonNode body = queryOverpass(form);
+        JsonNode body;
+        try {
+            body = http.get().uri(GEOAPIFY_PLACES_URL
+                            + "?categories={categories}&filter=circle:{lng},{lat},{radius}&bias=proximity:{lng},{lat}&limit=40&apiKey={key}",
+                            GEOAPIFY_CATEGORIES, lng, lat, radius, lng, lat, geoapifyApiKey)
+                    .retrieve()
+                    .body(JsonNode.class);
+        } catch (RestClientException e) {
+            log.warn("Geoapify places lookup failed: {}", e.getMessage());
+            throw new PlacesUnavailableException("Couldn't look up nearby places right now. You can still search or add one manually.", e);
+        }
 
         String borough = awaitBorough(boroughFuture);
         List<Place> places = new ArrayList<>();
         if (body != null) {
-            for (JsonNode el : body.path("elements")) {
-                JsonNode tags = el.path("tags");
-                double pLat = el.has("lat") ? el.path("lat").asDouble() : el.path("center").path("lat").asDouble();
-                double pLng = el.has("lon") ? el.path("lon").asDouble() : el.path("center").path("lon").asDouble();
+            for (JsonNode feature : body.path("features")) {
+                JsonNode props = feature.path("properties");
+                String name = text(props, "name");
+                if (name == null) continue;
+                JsonNode raw = props.path("datasource").path("raw");
+                double pLat = props.path("lat").asDouble();
+                double pLng = props.path("lon").asDouble();
                 places.add(new Place(
-                        el.path("type").asText() + "/" + el.path("id").asText(),
-                        tags.path("name").asText(),
-                        prettyCuisine(text(tags, "cuisine"), text(tags, "amenity")),
-                        streetAddress(tags),
+                        "geoapify/" + text(props, "place_id"),
+                        name,
+                        prettyCuisine(text(raw, "cuisine"), text(raw, "amenity")),
+                        geoapifyAddress(props),
                         borough,
                         pLat, pLng,
                         (int) Math.round(haversineMeters(lat, lng, pLat, pLng))));
@@ -143,36 +148,11 @@ public class OsmPlacesService {
         return result;
     }
 
-    /** Tries each Overpass mirror in turn, returning the first fresh success; throws only if all of them fail. */
-    private JsonNode queryOverpass(MultiValueMap<String, String> form) {
-        RestClientException lastFailure = null;
-        for (String url : OVERPASS_URLS) {
-            try {
-                JsonNode body = http.post().uri(url)
-                        .contentType(MediaType.APPLICATION_FORM_URLENCODED)
-                        .body(form)
-                        .retrieve()
-                        .body(JsonNode.class);
-                if (isFreshOverpassResponse(body)) return body;
-                log.warn("Overpass mirror {} returned a response with no valid data timestamp "
-                        + "(likely serving a stale database); trying the next mirror", url);
-            } catch (RestClientException e) {
-                log.warn("Overpass mirror {} failed: {}", url, e.getMessage());
-                lastFailure = e;
-            }
-        }
-        throw new PlacesUnavailableException("Couldn't look up nearby places right now. You can still search or add one manually.",
-                lastFailure);
-    }
-
-    /**
-     * Every genuine Overpass instance stamps its response with the real-world time its database
-     * was last updated (osm3s.timestamp_osm_base, e.g. "2026-10-04T19:50:58Z"). A misconfigured or
-     * stale instance can still return HTTP 200 with that field garbled and an empty result set —
-     * indistinguishable from "no places nearby" unless we check for a plausible timestamp first.
-     */
-    private static boolean isFreshOverpassResponse(JsonNode body) {
-        return body != null && body.path("osm3s").path("timestamp_osm_base").asText("").matches("\\d{4}-\\d{2}-\\d{2}T.*");
+    private static String geoapifyAddress(JsonNode props) {
+        String house = text(props, "housenumber");
+        String street = text(props, "street");
+        if (street == null) return text(props, "address_line1");
+        return house == null ? street : house + " " + street;
     }
 
     public List<Place> search(String q, Double nearLat, Double nearLng) {

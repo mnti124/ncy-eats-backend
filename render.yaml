@@ -19,3 +19,5 @@ services:
         sync: false   # optional; leave blank so anyone with the link can add places
       - key: OSM_USER_AGENT
         value: nyc-eats/1.0 (personal restaurant tracker)
+      - key: GEOAPIFY_API_KEY
+        sync: false   # free key from https://www.geoapify.com/ — powers "nearby restaurants"

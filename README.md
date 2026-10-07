@@ -91,7 +91,8 @@ Vercel can't host a Java server, so the API goes on Render (free tier works). Ra
 | `PORT` | `8080` | HTTP port (Render sets this) |
 | `ALLOWED_ORIGINS` | `http://localhost:3000,https://*.vercel.app` | CORS (only matters if a browser calls the API directly) |
 | `EDIT_KEY` | *(blank)* | If set, POST/PATCH/DELETE require header `X-Edit-Key` with this value |
-| `OSM_USER_AGENT` | `nyc-eats/1.0 …` | Identifies you to OpenStreetMap — add your email |
+| `OSM_USER_AGENT` | `nyc-eats/1.0 …` | Identifies you to OpenStreetMap (used for search/geocoding) — add your email |
+| `GEOAPIFY_API_KEY` | *(blank)* | Free key from [geoapify.com](https://www.geoapify.com/) — powers "nearby restaurants" |
 | `DB_POOL_SIZE` | `5` | Connection pool size (keep small on Supabase free tier) |
 
 ## Database

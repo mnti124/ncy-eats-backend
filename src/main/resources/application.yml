@@ -38,6 +38,10 @@ app:
   edit-key: ${EDIT_KEY:}
   # Identifies the app to OpenStreetMap services (their usage policy requires a real contact).
   osm-user-agent: ${OSM_USER_AGENT:nyc-eats/1.0 (personal restaurant tracker)}
+  # Powers "nearby restaurants" (api.geoapify.com/v2/places). Free tier: https://www.geoapify.com/
+  # Public Overpass instances turned out to be unreliable from hosted environments (several block
+  # cloud/hosting IP ranges outright, others are just flaky), so nearby search uses this instead.
+  geoapify-api-key: ${GEOAPIFY_API_KEY:}
 
 management:
   endpoints:

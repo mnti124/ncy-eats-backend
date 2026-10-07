@@ -6,7 +6,7 @@ import java.util.Arrays;
 import java.util.List;
 
 @ConfigurationProperties(prefix = "app")
-public record AppProperties(String allowedOrigins, String editKey, String osmUserAgent) {
+public record AppProperties(String allowedOrigins, String editKey, String osmUserAgent, String geoapifyApiKey) {
 
     public List<String> allowedOriginList() {
         if (allowedOrigins == null || allowedOrigins.isBlank()) return List.of();
