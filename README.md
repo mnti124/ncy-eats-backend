@@ -78,6 +78,13 @@ Vercel can't host a Java server, so the API goes on Render (free tier works). Ra
 
 > **Free tier note:** Render sleeps the service after ~15 minutes idle. The next request takes 30–60 s
 > while it wakes; the web app shows a "waking up" message. The paid Starter plan stays awake.
+>
+> `.github/workflows/keep-warm.yml` pings `/actuator/health` every 10 minutes to keep the free-tier
+> service from ever going idle in the first place. It targets `https://nyc-eats-api.onrender.com` —
+> update the URL in that file if the service is renamed. Note GitHub disables scheduled workflows
+> after 60 days without a push to the repo (push anything, or re-run manually, to re-enable), and
+> Render's free plan has a monthly instance-hour cap shared across your free services — staying awake
+> 24/7 uses ~720 hours/month of it.
 
 ---
 

@@ -1,0 +1,35 @@
+name: Keep Render service warm
+
+# Render's free plan spins the service down after ~15 minutes with no traffic, and the
+# next request then pays a 30-60s cold start. Pinging the health endpoint well inside
+# that window keeps it from ever going idle.
+#
+# Caveats:
+#   - GitHub can delay scheduled runs by a few minutes under load, so this uses a
+#     10-minute cadence (not 15) for margin.
+#   - GitHub disables scheduled workflows on a repo after 60 days with no commits/pushes
+#     to it. Push anything to re-enable, or trigger "Run workflow" manually below.
+#   - Render's free tier has a monthly instance-hour cap shared across your free services.
+#     Keeping this one awake 24/7 uses ~720 hours/month, which may leave little headroom
+#     for other free services on the same account.
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch: {}
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping /actuator/health
+        run: |
+          url="https://nyc-eats-api.onrender.com/actuator/health"
+          for attempt in 1 2 3; do
+            if curl -fsS --max-time 90 "$url"; then
+              exit 0
+            fi
+            echo "Attempt $attempt failed; retrying in 10s"
+            sleep 10
+          done
+          echo "All attempts failed"
+          exit 1
